@@ -16,10 +16,13 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.permission.HealthPermission
+import androidx.health.connect.client.records.DistanceRecord
+import androidx.health.connect.client.records.Record
 import androidx.health.connect.client.records.StepsRecord
 import androidx.health.connect.client.records.metadata.Device
 import androidx.health.connect.client.records.metadata.Metadata
 import androidx.health.connect.client.time.TimeRangeFilter
+import androidx.health.connect.client.units.Length
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -32,33 +35,29 @@ import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import kotlin.math.roundToInt
 import kotlin.math.roundToLong
 import kotlin.random.Random
 
 /*
- * Ce fichier regroupe toute la logique "métier" de la v2, en trois blocs :
- *   1. Seance        : construction et écriture des 35 enregistrements de pas dans Health Connect
- *                      (+ effacement, notification, mémorisation du dernier résultat).
- *   2. Planificateur : calcul de la prochaine occurrence de 6h35 et armement de l'alarme.
- *   3. AlarmReceiver : point d'entrée déclenché par l'alarme (écriture) et par le redémarrage (réarmement).
+ * Logique "métier" de la v3, en trois blocs :
+ *   1. Seance        : construction et écriture des enregistrements (pas, et distance en option)
+ *                      dans Health Connect, minute par minute ; effacement ; notification ; mémoire.
+ *   2. Planificateur : alarme quotidienne à l'heure de fin de la séance paramétrée.
+ *   3. AlarmReceiver : point d'entrée de l'alarme (écriture de la séance du jour) et du redémarrage.
  *
- * Principe v2 : rien ne tourne en arrière-plan pendant la séance. À 6h35 l'alarme réveille
- * l'app quelques secondes, qui écrit d'un coup la séance 6h00-6h35 déjà passée, minute par minute.
+ * Principe inchangé depuis la v2 : rien ne tourne pendant la séance. L'alarme réveille l'app
+ * quelques secondes à la fin de la séance, qui écrit d'un coup une séance déjà passée.
+ * Tous les réglages (heure, durée, objectif en pas ou en km...) viennent de Parametres.
  */
 
-/** Paramètres de la séance et opérations Health Connect. */
+/** Opérations Health Connect et utilitaires de séance. */
 object Seance {
     const val TAG = "StepSimulator"
 
-    // ---- Réglages (les seules valeurs à toucher pour changer la séance) ----
-    val HEURE_DEBUT: LocalTime = LocalTime.of(6, 0)    // début de la séance écrite
-    val HEURE_ALARME: LocalTime = LocalTime.of(6, 35)  // heure de réveil : la séance est déjà terminée
-    const val DUREE_MINUTES = 35                       // durée de la séance = nombre d'enregistrements
-    const val PAS_MIN = 6200                           // total quotidien tiré au sort dans [PAS_MIN, PAS_MAX]
-    const val PAS_MAX = 6800                           // ("environ 6 500", sans être identique chaque jour)
-
-    /** Permission Health Connect demandée : "android.permission.health.WRITE_STEPS". */
+    /** Permissions Health Connect : "android.permission.health.WRITE_STEPS" et "...WRITE_DISTANCE". */
     val PERMISSION_ECRITURE_PAS: String = HealthPermission.getWritePermission(StepsRecord::class)
+    val PERMISSION_ECRITURE_DISTANCE: String = HealthPermission.getWritePermission(DistanceRecord::class)
 
     const val CANAL_NOTIF = "seances"
     private const val PREFS = "stepsimulator"
@@ -70,37 +69,53 @@ object Seance {
     /** Compte rendu d'une opération, affiché à l'écran, notifié et mémorisé. */
     data class Resultat(val succes: Boolean, val message: String)
 
-    /**
-     * Métadonnées attachées à chaque enregistrement.
-     * Choix v2 : "enregistré automatiquement par le téléphone", car certaines applications de
-     * challenge ignorent les pas marqués "saisie manuelle". Pour l'alternative transparente,
-     * remplacer par : Metadata.manualEntry()
-     */
-    private fun metadonnees(): Metadata = Metadata.autoRecorded(
-        Device(type = Device.TYPE_PHONE, manufacturer = Build.MANUFACTURER, model = Build.MODEL)
-    )
+    fun formatPas(pas: Int): String = String.format(Locale.FRENCH, "%,d", pas)
+    fun formatKm(km: Double): String = String.format(Locale.FRENCH, "%.1f", km)
 
     /**
-     * Répartit [total] pas sur [minutes] enregistrements avec un léger aléa (±15 %) pour éviter
-     * un rythme parfaitement régulier. La dernière minute absorbe l'arrondi : la somme vaut [total].
+     * Métadonnées attachées à chaque enregistrement.
+     * Réglage "Déclarer comme saisie manuelle" désactivé (défaut) : "enregistré automatiquement par
+     * le téléphone", car certaines applications de challenge ignorent les saisies manuelles.
+     * Activé : "saisie manuelle", le marquage transparent.
+     */
+    private fun metadonnees(parametres: Parametres): Metadata =
+        if (parametres.saisieManuelle) Metadata.manualEntry()
+        else Metadata.autoRecorded(Device(type = Device.TYPE_PHONE, manufacturer = Build.MANUFACTURER, model = Build.MODEL))
+
+    /**
+     * Répartit [total] pas sur [minutes] enregistrements avec un léger aléa (±15 %) pour éviter un
+     * rythme parfaitement régulier. Chaque minute compte au moins 1 pas (exigence Health Connect),
+     * la dernière minute absorbe l'arrondi : la somme vaut exactement [total].
      */
     fun repartirPas(total: Int, minutes: Int, alea: Random = Random.Default): List<Long> {
-        require(minutes > 0) { "Durée invalide" }
+        require(minutes in 1..total) { "Il faut au moins 1 pas par minute" }
         val poids = List(minutes) { 0.85 + alea.nextDouble() * 0.30 }
         val sommePoids = poids.sum()
-        val repartition = poids.map { (it / sommePoids * total).roundToLong() }.toMutableList()
-        repartition[repartition.lastIndex] += total - repartition.sum()
+        val repartition = poids.map { (it / sommePoids * total).roundToLong().coerceAtLeast(1L) }.toMutableList()
+        repartition[repartition.lastIndex] = (total - repartition.dropLast(1).sum()).coerceAtLeast(1L)
         return repartition
     }
 
     /**
-     * Écrit la séance [debut, fin[ dans Health Connect : un StepsRecord par minute.
-     * Appelée par l'alarme (séance 6h00-6h35) et par le bouton "Tester maintenant".
+     * Écrit une séance [debut, fin[ de [totalPas] pas dans Health Connect : un StepsRecord par minute,
+     * plus un DistanceRecord par minute si le réglage "écrire la distance" est actif et autorisé.
+     * Appelée par l'alarme (séance quotidienne) et par l'écran (séance manuelle).
      * Ne lève jamais d'exception : le résultat est renvoyé, notifié et mémorisé.
      */
-    suspend fun ecrire(context: Context, debut: ZonedDateTime, fin: ZonedDateTime, origine: String): Resultat {
+    suspend fun ecrire(
+        context: Context,
+        debut: ZonedDateTime,
+        fin: ZonedDateTime,
+        totalPas: Int,
+        parametres: Parametres,
+        origine: String,
+    ): Resultat {
+        val minutes = Duration.between(debut, fin).toMinutes().toInt()
         val resultat = try {
             when {
+                minutes < 1 -> Resultat(false, "Durée invalide")
+                totalPas < minutes -> Resultat(false, "Trop peu de pas pour la durée : au moins 1 pas par minute")
+                fin.isAfter(ZonedDateTime.now()) -> Resultat(false, "La séance se terminerait dans le futur : Health Connect refuse")
                 HealthConnectClient.getSdkStatus(context) != HealthConnectClient.SDK_AVAILABLE ->
                     Resultat(false, "Health Connect indisponible sur ce téléphone")
 
@@ -110,22 +125,39 @@ object Seance {
                     if (PERMISSION_ECRITURE_PAS !in accordees) {
                         Resultat(false, "Permission d'écriture des pas non accordée : ouvrez l'app et autorisez Health Connect")
                     } else {
-                        val minutes = Duration.between(debut, fin).toMinutes().toInt()
-                        val total = Random.nextInt(PAS_MIN, PAS_MAX + 1)
-                        val enregistrements = repartirPas(total, minutes).mapIndexed { i, pas ->
+                        val avecDistance = parametres.ecrireDistance && PERMISSION_ECRITURE_DISTANCE in accordees
+                        val enregistrements = mutableListOf<Record>()
+                        repartirPas(totalPas, minutes).forEachIndexed { i, pas ->
                             val debutMinute = debut.plusMinutes(i.toLong())
                             val finMinute = debutMinute.plusMinutes(1)
-                            StepsRecord(
+                            enregistrements += StepsRecord(
                                 startTime = debutMinute.toInstant(),
                                 startZoneOffset = debutMinute.offset,
                                 endTime = finMinute.toInstant(),
                                 endZoneOffset = finMinute.offset,
                                 count = pas,
-                                metadata = metadonnees()
+                                metadata = metadonnees(parametres)
+                            )
+                            if (avecDistance) enregistrements += DistanceRecord(
+                                startTime = debutMinute.toInstant(),
+                                startZoneOffset = debutMinute.offset,
+                                endTime = finMinute.toInstant(),
+                                endZoneOffset = finMinute.offset,
+                                distance = Length.meters(pas * parametres.fouleeCm / 100.0),
+                                metadata = metadonnees(parametres)
                             )
                         }
                         client.insertRecords(enregistrements)
-                        Resultat(true, "$total pas écrits de ${debut.format(FORMAT_HEURE)} à ${fin.format(FORMAT_HEURE)} ($origine)")
+                        val contenu = when {
+                            avecDistance -> "pas + distance"
+                            parametres.ecrireDistance -> "pas seuls, permission distance manquante"
+                            else -> "pas"
+                        }
+                        Resultat(
+                            true,
+                            "${formatPas(totalPas)} pas (${formatKm(parametres.kmDepuisPas(totalPas))} km) écrits de " +
+                                "${debut.format(FORMAT_DATE_HEURE)} à ${fin.format(FORMAT_HEURE)} · $origine · $contenu"
+                        )
                     }
                 }
             }
@@ -139,19 +171,17 @@ object Seance {
     }
 
     /**
-     * Efface les pas écrits par CETTE application au cours des [heures] dernières heures.
-     * Health Connect n'autorise une app à supprimer que ses propres données : aucun risque
-     * pour les pas d'autres sources.
+     * Efface les pas et distances écrits par CETTE application au cours des [heures] dernières heures.
+     * Health Connect n'autorise une app à supprimer que ses propres données.
      */
     suspend fun effacer(context: Context, heures: Long = 24): Resultat {
         val resultat = try {
             val client = HealthConnectClient.getOrCreate(context)
             val maintenant = Instant.now()
-            client.deleteRecords(
-                StepsRecord::class,
-                TimeRangeFilter.between(maintenant.minus(Duration.ofHours(heures)), maintenant)
-            )
-            Resultat(true, "Pas écrits par l'app effacés (dernières $heures h)")
+            val plage = TimeRangeFilter.between(maintenant.minus(Duration.ofHours(heures)), maintenant)
+            client.deleteRecords(StepsRecord::class, plage)
+            client.deleteRecords(DistanceRecord::class, plage)
+            Resultat(true, "Données écrites par l'app effacées (dernières $heures h)")
         } catch (e: Exception) {
             Log.e(TAG, "Échec de l'effacement", e)
             Resultat(false, "Échec de l'effacement : ${e.javaClass.simpleName} ${e.message.orEmpty()}")
@@ -198,7 +228,8 @@ object Seance {
         prefs(context).edit().putString(CLE_DERNIER_RESULTAT, "$horodatage – ${resultat.message}").apply()
     }
 
-    fun dernierResultat(context: Context): String = prefs(context).getString(CLE_DERNIER_RESULTAT, null) ?: "aucune écriture pour l'instant"
+    fun dernierResultat(context: Context): String =
+        prefs(context).getString(CLE_DERNIER_RESULTAT, null) ?: "aucune écriture pour l'instant"
 
     fun dateDerniereSeanceAutomatique(context: Context): String? = prefs(context).getString(CLE_DATE_DERNIERE_SEANCE, null)
 
@@ -211,26 +242,33 @@ object Seance {
 object Planificateur {
     const val ACTION_SEANCE = "com.rostat.stepsimulator.action.SEANCE"
 
-    /** Prochain 6h35 strictement dans le futur (aujourd'hui si pas encore passé, sinon demain). */
-    fun prochaineOccurrence(maintenant: ZonedDateTime = ZonedDateTime.now()): ZonedDateTime {
-        val aujourdHui = maintenant.with(Seance.HEURE_ALARME).withSecond(0).withNano(0)
+    /** Prochaine occurrence de [heure] strictement dans le futur (aujourd'hui si pas encore passée, sinon demain). */
+    fun prochaineOccurrence(heure: LocalTime, maintenant: ZonedDateTime = ZonedDateTime.now()): ZonedDateTime {
+        val aujourdHui = maintenant.with(heure).withSecond(0).withNano(0)
         return if (aujourdHui.isAfter(maintenant)) aujourdHui else aujourdHui.plusDays(1)
     }
 
+    private fun pendingIntent(context: Context): PendingIntent = PendingIntent.getBroadcast(
+        context, 0, Intent(context, AlarmReceiver::class.java).setAction(ACTION_SEANCE),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+    )
+
     /**
-     * (Ré)arme l'alarme. Le même PendingIntent (requestCode 0) est remplacé à chaque appel :
-     * appeler plusieurs fois ne crée jamais de doublon.
-     * setAndAllowWhileIdle : sonne même en mode "Doze" (écran éteint, téléphone posé),
-     * avec un décalage possible de quelques minutes, accepté par la v2.
+     * (Ré)arme l'alarme à l'heure de fin de la séance paramétrée, ou l'annule si la séance
+     * quotidienne est désactivée. Renvoie la prochaine occurrence, ou null si désactivée.
+     * Le même PendingIntent (requestCode 0) est remplacé à chaque appel : jamais de doublon.
+     * setAndAllowWhileIdle : sonne même en veille profonde (Doze), avec un décalage possible
+     * de quelques minutes, accepté par conception.
      */
-    fun planifier(context: Context): ZonedDateTime {
-        val prochaine = prochaineOccurrence()
+    fun planifier(context: Context, parametres: Parametres = Parametres.charger(context)): ZonedDateTime? {
         val gestionnaire = context.getSystemService(AlarmManager::class.java)
-        val intention = Intent(context, AlarmReceiver::class.java).setAction(ACTION_SEANCE)
-        val pendingIntent = PendingIntent.getBroadcast(
-            context, 0, intention, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        gestionnaire.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, prochaine.toInstant().toEpochMilli(), pendingIntent)
+        if (!parametres.seanceActive) {
+            gestionnaire.cancel(pendingIntent(context))
+            Log.i(Seance.TAG, "Séance quotidienne désactivée : alarme annulée")
+            return null
+        }
+        val prochaine = prochaineOccurrence(parametres.heureFin)
+        gestionnaire.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, prochaine.toInstant().toEpochMilli(), pendingIntent(context))
         Log.i(Seance.TAG, "Alarme armée pour $prochaine")
         return prochaine
     }
@@ -248,13 +286,15 @@ class AlarmReceiver : BroadcastReceiver() {
             Intent.ACTION_BOOT_COMPLETED -> Planificateur.planifier(context)
 
             Planificateur.ACTION_SEANCE -> {
-                Planificateur.planifier(context) // réarmer AVANT d'écrire : même en cas d'échec, demain est couvert
+                val parametres = Parametres.charger(context)
+                Planificateur.planifier(context, parametres) // réarmer AVANT d'écrire : demain est couvert même en cas d'échec
+                if (!parametres.seanceActive) return
                 // goAsync() : garde le processus (et le réveil du téléphone) vivant le temps de l'écriture,
                 // l'API Health Connect étant asynchrone. finish() est obligatoire à la fin.
                 val enAttente = goAsync()
                 CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
                     try {
-                        ecrireSeanceDuJour(context)
+                        ecrireSeanceDuJour(context, parametres)
                     } finally {
                         enAttente.finish()
                     }
@@ -263,15 +303,17 @@ class AlarmReceiver : BroadcastReceiver() {
         }
     }
 
-    private suspend fun ecrireSeanceDuJour(context: Context) {
+    private suspend fun ecrireSeanceDuJour(context: Context, parametres: Parametres) {
         val zone = ZoneId.systemDefault()
         val maintenant = ZonedDateTime.now(zone)
         val aujourdHui = maintenant.toLocalDate()
-        val debut = aujourdHui.atTime(Seance.HEURE_DEBUT).atZone(zone)
-        val fin = debut.plusMinutes(Seance.DUREE_MINUTES.toLong())
+        // La séance du jour est celle qui se termine aujourd'hui à l'heure de fin paramétrée ;
+        // son début peut être la veille si elle passe minuit.
+        val fin = aujourdHui.atTime(parametres.heureFin).atZone(zone)
+        val debut = fin.minusMinutes(parametres.dureeMinutes.toLong())
 
         // Garde-fou 1 : alarme délivrée très en retard, après minuit (téléphone éteint la veille) :
-        // la séance "du jour" serait dans le futur, refusée par Health Connect. On attend 6h35.
+        // la séance "du jour" serait dans le futur, refusée par Health Connect. On attend la prochaine.
         if (fin.isAfter(maintenant)) {
             Log.w(Seance.TAG, "Séance du jour pas encore terminée ($fin) : écriture reportée")
             return
@@ -281,7 +323,13 @@ class AlarmReceiver : BroadcastReceiver() {
             Log.i(Seance.TAG, "Séance du $aujourdHui déjà écrite : rien à faire")
             return
         }
-        val resultat = Seance.ecrire(context, debut, fin, origine = "alarme")
+        // Total du jour : objectif ± variation aléatoire, pour ne pas écrire le même total chaque jour.
+        val objectif = parametres.objectifPas()
+        val variation = parametres.variationPourcent / 100.0
+        val total = if (variation <= 0.0) objectif
+        else (objectif * (1.0 + Random.nextDouble(-variation, variation))).roundToInt().coerceAtLeast(1)
+
+        val resultat = Seance.ecrire(context, debut, fin, total, parametres, origine = "séance quotidienne")
         if (resultat.succes) Seance.memoriserDateSeanceAutomatique(context, aujourdHui)
     }
 }

@@ -1,5 +1,5 @@
 # Compile l'APK de debug dans le cloud (aucun Android Studio nécessaire) à chaque push,
-# puis le publie dans une pré-release GitHub "v2-latest" téléchargeable directement depuis le téléphone.
+# puis le publie dans la pré-release GitHub "latest", téléchargeable directement depuis le téléphone.
 name: Build APK
 
 on:
@@ -36,21 +36,26 @@ jobs:
           chmod +x gradlew
           ./gradlew --no-daemon assembleDebug
 
+      - name: Lire la version de l'app
+        id: version
+        run: echo "name=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts)" >> "$GITHUB_OUTPUT"
+
       - name: Renommer l'APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk StepSimulator-v2-debug.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk "StepSimulator-v${{ steps.version.outputs.name }}-debug.apk"
 
       - name: Conserver l'APK comme artefact du run
         uses: actions/upload-artifact@v4
         with:
-          name: StepSimulator-v2-debug-apk
-          path: StepSimulator-v2-debug.apk
+          name: StepSimulator-v${{ steps.version.outputs.name }}-debug-apk
+          path: StepSimulator-v${{ steps.version.outputs.name }}-debug.apk
 
-      - name: Publier la pré-release "v2-latest"
+      - name: Publier la pré-release "latest"
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.name }}
         run: |
-          gh release delete v2-latest --yes --cleanup-tag || true
-          gh release create v2-latest StepSimulator-v2-debug.apk \
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest "StepSimulator-v${VERSION}-debug.apk" \
             --prerelease \
-            --title "StepSimulator v2 – build ${GITHUB_SHA::7}" \
-            --notes "APK de debug compilé automatiquement depuis la branche ${GITHUB_REF_NAME} (commit ${GITHUB_SHA}). Installation : télécharger l'APK sur le téléphone, autoriser les sources inconnues, installer."
+            --title "StepSimulator v${VERSION} – build ${GITHUB_SHA::7}" \
+            --notes "APK de debug compilé automatiquement depuis la branche ${GITHUB_REF_NAME} (commit ${GITHUB_SHA}). Installation : télécharger l'APK sur le téléphone, autoriser les sources inconnues, installer par-dessus la version précédente."

@@ -1,4 +1,4 @@
-// Module applicatif : StepSimulator v2 (Kotlin + Health Connect).
+// Module applicatif : StepSimulator v3 (Kotlin + Health Connect).
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
@@ -14,8 +14,8 @@ android {
         applicationId = "com.rostat.stepsimulator"
         minSdk = 28          // Health Connect (app Play Store) exige Android 9 minimum
         targetSdk = 36
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 3
+        versionName = "3.0"
     }
 
     // Clé de debug versionnée dans le dépôt (app/debug.keystore, mot de passe standard "android").

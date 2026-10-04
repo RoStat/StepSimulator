@@ -1,13 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  StepSimulator v2 : manifeste Android.
+  StepSimulator v3 : manifeste Android.
   Aucune ressource XML (layout, thème, icône) : l'interface est construite en Kotlin,
-  le thème et l'icône par défaut du système sont utilisés, pour tenir en 4 fichiers de code.
+  le thème et l'icône par défaut du système sont utilisés, pour rester minimal.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!-- Écriture des pas dans Health Connect (permission "santé", accordée dans l'écran Health Connect) -->
     <uses-permission android:name="android.permission.health.WRITE_STEPS" />
+    <!-- Écriture de la distance (option "écrire aussi la distance") -->
+    <uses-permission android:name="android.permission.health.WRITE_DISTANCE" />
     <!-- Notification de compte rendu après chaque écriture (Android 13+ : permission à l'exécution) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Réarmer l'alarme quotidienne après un redémarrage du téléphone -->
